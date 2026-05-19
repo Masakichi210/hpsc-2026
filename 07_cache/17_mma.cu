@@ -1,6 +1,8 @@
-// 13_tensorcore.cu  --  HPSC 2026 final submission (kawamura).
-//   H100 SGEMM (FP32 I/O, FP16 mma) at ~168 TFlops (~46% of cuBLAS).
-//   128x128 tile, cp.async double buffer, ldmatrix + mma.sync.m16n8k16.
+// 17_mma.cu  --  HPSC 2026 SGEMM optimization, step 4:
+//   Replaces all wmma calls with inline PTX (ldmatrix + mma.sync.m16n8k16),
+//   keeping the pipeline (cp.async, 2-stage stg + 2-stage wrk, half2 conv)
+//   from 16_dbuf. No shmem swizzle yet -- this version is a correctness /
+//   parity baseline for 18 which will add swizzling.
 //
 // Per-warp per-K-step (K=16) work:
 //   - 4 x ldmatrix.trans.x4 to load four 16x16 A fragments from wrkA[k][m]

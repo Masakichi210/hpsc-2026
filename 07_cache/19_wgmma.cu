@@ -1,15 +1,21 @@
-// 13_tensorcore.cu  --  HPSC 2026 final submission (kawamura).
-//   H100 SGEMM (FP32 I/O, FP16 mma) at ~168 TFlops (~46% of cuBLAS).
-//   128x128 tile, cp.async double buffer, ldmatrix + mma.sync.m16n8k16.
+// 19_wgmma.cu  --  HPSC 2026 SGEMM optimization, step 6:
+//   Hopper-native WGMMA. Each 4-warp warp-group (WG) issues a single
+//   wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 per K-step (K=16);
+//   the block has 2 WGs covering M=128 in pairs of 64.
 //
-// Per-warp per-K-step (K=16) work:
-//   - 4 x ldmatrix.trans.x4 to load four 16x16 A fragments from wrkA[k][m]
-//   - 2 x ldmatrix.trans.x4 to load 16x32 of B (= four 16x8 B fragments)
-//       from wrkB[k][n]
-//   - 16 x mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+//   Build flags: -arch=sm_90a (wgmma is sm_90a-only).
 //
-// Each warp accumulates a 64 (M) x 32 (N) tile = 4 WTM x 4 WTN mma blocks.
-// Eight warps per block cover 128 x 128.
+//   Pipeline (same shape as 17, just MMA primitive swapped):
+//     cp.async FP32 -> stgA/stgB (2 stages)
+//     convert       FP32 -> half to wrkA/wrkB (1 stage of working tile)
+//     wgmma         FP16 in shmem -> 64 FP32 accumulators per thread
+//
+//   Shmem layout (no swizzle, descriptor mode 0):
+//     wrkA: K_TILE rows of M_TILE halfs (M-major)        LD = M_TILE halfs
+//     wrkB: K_TILE rows of N_TILE halfs (N-major)        LD = N_TILE halfs
+//   wgmma descriptor for MN-major fp16 with no swizzle:
+//     leading_byte_offset = 16  (step to next 8-element fast-dim chunk)
+//     stride_byte_offset  = LD * 2  (step to next K row)
 
 #include <iostream>
 #include <typeinfo>
@@ -26,24 +32,17 @@ using namespace nvcuda;
 #define K_TILE   32
 #define STAGES   2
 
-#define WARPS_M  2
-#define WARPS_N  4
-#define WARPS    (WARPS_M * WARPS_N)
-#define THREADS  (WARPS * 32)
+#define WG_M           64           // wgmma m
+#define WG_N           N_TILE       // 128 -- single wgmma per WG covers whole N
+#define WG_K           16           // wgmma k
+#define WGS_PER_BLOCK  (M_TILE / WG_M)   // 2
+#define WARPS_PER_WG   4
+#define WARPS          (WGS_PER_BLOCK * WARPS_PER_WG)   // 8
+#define THREADS        (WARPS * 32)                     // 256
+#define ACCS_PER_TH    (WG_M * WG_N / 128)              // 64 (= 8192 / 128)
 
-#define M_WARP   (M_TILE / WARPS_M)         // 64
-#define N_WARP   (N_TILE / WARPS_N)         // 32
-
-#define MMA_M    16
-#define MMA_N    8
-#define MMA_K    16
-#define WTM      (M_WARP / MMA_M)           // 4
-#define WTN      (N_WARP / MMA_N)           // 4
-
-// wrkA[k][m], wrkB[k][n]; +8 half pad to break bank patterns
-// (proper XOR swizzle comes in 18).
-#define WRK_A_LD (M_TILE + 8)
-#define WRK_B_LD (N_TILE + 8)
+#define WRK_A_LD       M_TILE       // halfs
+#define WRK_B_LD       N_TILE       // halfs
 
 #define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 4))   // 4
 #define B_STEPS  ((N_TILE * K_TILE) / (THREADS * 4))   // 4
@@ -64,51 +63,82 @@ __device__ __forceinline__ void cp_async_wait_all() {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
 
-// ---- ldmatrix helpers ----
-// Loads a 16x16 (4 x 8x8 sub-tiles) of fp16 from shared memory with transpose.
-// Returns 4 .b32 regs per thread (= 8 halfs = 4 half2).
-__device__ __forceinline__
-void ldmatrix_trans_x4(uint32_t (&r)[4], uint32_t smem_int_ptr) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-        "{%0, %1, %2, %3}, [%4];\n"
-        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-        : "r"(smem_int_ptr));
+// ---- wgmma helpers ----
+__device__ __forceinline__ void wgmma_fence() {
+    asm volatile("wgmma.fence.sync.aligned;\n");
+}
+__device__ __forceinline__ void wgmma_commit() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n");
+}
+__device__ __forceinline__ void wgmma_wait0() {
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n");
 }
 
-// ---- mma helpers ----
-// D = A * B + C   (m16 n8 k16, fp32 acc, fp16 inputs)
-//   A: 4 x .b32  (= 8 fp16)
-//   B: 2 x .b32  (= 4 fp16)
-//   C/D: 4 x .f32
+// Build a 64-bit wgmma matrix descriptor.
+//   leading_off  : byte offset to next 8-element chunk in the fast dim
+//                  (= 16 for MN-major fp16: 8 halfs)
+//   stride_off   : byte offset to next row in the slow dim
+//                  (= LD * sizeof(half) for our layout)
 __device__ __forceinline__
-void mma_m16n8k16(float (&d)[4],
-                  const uint32_t (&a)[4],
-                  const uint32_t (&b)[2],
-                  const float (&c)[4]) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3}, "
-        "{%4, %5, %6, %7}, "
-        "{%8, %9}, "
-        "{%10, %11, %12, %13};\n"
-        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1]),
-          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+uint64_t make_desc(const void* smem_ptr,
+                   uint32_t leading_off,
+                   uint32_t stride_off,
+                   uint32_t swizzle = 0) {
+    uint64_t addr = static_cast<uint64_t>(__cvta_generic_to_shared(smem_ptr));
+    uint64_t desc = 0;
+    desc |= (addr >> 4)                       & 0x3FFFULL;
+    desc |= (uint64_t)((leading_off >> 4) & 0x3FFF) << 16;
+    desc |= (uint64_t)((stride_off  >> 4) & 0x3FFF) << 32;
+    desc |= (uint64_t)(swizzle & 0x3)              << 62;
+    return desc;
 }
 
-__global__ void sgemm_v17(int M, int N, int K,
+// wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16
+// d[0..63] is accumulator (scaleD = 1 means D = A*B + D).
+// transA, transB: 1 for MN-major operands (m-major A or n-major B in our case).
+__device__ __forceinline__
+void wgmma_m64n128k16(float* d, uint64_t descA, uint64_t descB) {
+    asm volatile(
+        "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7,"
+        " %8,%9,%10,%11,%12,%13,%14,%15,"
+        " %16,%17,%18,%19,%20,%21,%22,%23,"
+        " %24,%25,%26,%27,%28,%29,%30,%31,"
+        " %32,%33,%34,%35,%36,%37,%38,%39,"
+        " %40,%41,%42,%43,%44,%45,%46,%47,"
+        " %48,%49,%50,%51,%52,%53,%54,%55,"
+        " %56,%57,%58,%59,%60,%61,%62,%63}, "
+        " %64, %65, 1, 1, 1, 1, 1;\n"
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]),
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]),
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]),
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
+          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
+          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
+          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
+          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
+          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
+          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
+          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])
+        : "l"(descA), "l"(descB));
+}
+
+__global__ void sgemm_v19(int M, int N, int K,
                           const float* __restrict__ A,
                           const float* __restrict__ B,
                           float* __restrict__ C) {
     const int bm = blockIdx.x * M_TILE;
     const int bn = blockIdx.y * N_TILE;
     const int tid = threadIdx.x;
-    const int warp_id = tid >> 5;
-    const int lane = tid & 31;
-    const int wm = warp_id / WARPS_N;        // 0..1
-    const int wn = warp_id % WARPS_N;        // 0..3
+    const int wg_id = tid / (WARPS_PER_WG * 32);   // 0..1
+    const int t_in_wg = tid - wg_id * (WARPS_PER_WG * 32);
+    const int warp_in_wg = t_in_wg / 32;            // 0..3
+    const int lane = t_in_wg & 31;
 
     extern __shared__ unsigned char smem[];
     float* stgA = reinterpret_cast<float*>(smem);
@@ -177,17 +207,12 @@ __global__ void sgemm_v17(int M, int N, int K,
         }
     };
 
-    // Accumulators: WTM x WTN tiles of 16x8, each held as 4 floats per thread.
-    float acc[WTM][WTN][4];
+    // Accumulators (64 fp32 per thread). WGMMA accumulates into these.
+    float acc[ACCS_PER_TH];
     #pragma unroll
-    for (int i = 0; i < WTM; i++)
-        #pragma unroll
-        for (int j = 0; j < WTN; j++)
-            #pragma unroll
-            for (int x = 0; x < 4; x++)
-                acc[i][j][x] = 0.0f;
+    for (int i = 0; i < ACCS_PER_TH; i++) acc[i] = 0.0f;
 
-    // ---- Prologue: load + convert tile 0 ----
+    // Prologue
     issue_load(0, 0);
     cp_async_commit();
 
@@ -207,102 +232,52 @@ __global__ void sgemm_v17(int M, int N, int K,
         convert_stage(cur);
         __syncthreads();
 
-        // ---- MMA over K_TILE in steps of MMA_K=16 ----
         const int wrkA_base = cur * (K_TILE * WRK_A_LD);
         const int wrkB_base = cur * (K_TILE * WRK_B_LD);
 
-        // Compute lane-local row address used by ldmatrix.
-        // ldmatrix.x4 takes 32 thread addresses (one row each, 8 halfs).
-        // For matrix_a 16x16 col-major-in-shmem, with .trans we feed:
-        //   lane T (0..7)  -> row offset (kk + T)   in K, col offset 0       in M
-        //   lane T (8..15) -> row offset (kk + T-8) in K, col offset 8       in M
-        //   lane T (16..23)-> row offset (kk + T-16 + 8) in K, col offset 0  in M
-        //   lane T (24..31)-> row offset (kk + T-24 + 8) in K, col offset 8  in M
-        // For matrix_b (16x16 = 2 N-tiles of 16x8 stacked horizontally in N),
-        // similar pattern but col offset spans 16 N halfs.
-        //
-        // A is loaded once per M-tile (WTM = 4 calls per K-step).
-        // B is loaded once per pair of N-tiles (WTN/2 = 2 calls per K-step).
-        const int lane_row_a = (lane & 7) + ((lane >> 4) << 3);      // 0..7 or 8..15
-        const int lane_col_a = ((lane >> 3) & 1) << 3;               // 0 or 8
-        const int lane_row_b = (lane & 7) + ((lane >> 4) << 3);
-        const int lane_col_b = ((lane >> 3) & 1) << 3;
+        // Issue WGMMAs for this iter's K_TILE in chunks of WG_K=16.
+        // This WG covers M rows [wg_m_off, wg_m_off + WG_M).
+        const int wg_m_off = wg_id * WG_M;
 
-        uint32_t a_regs[WTM][4];
-        uint32_t b_regs[WTN][2];
-
+        wgmma_fence();
         #pragma unroll
-        for (int kk = 0; kk < K_TILE; kk += MMA_K) {
-            // Load A: 4 ldmatrix.trans.x4, one per M tile.
-            #pragma unroll
-            for (int i = 0; i < WTM; i++) {
-                int m_base = wm * M_WARP + i * MMA_M;
-                int row = kk + lane_row_a;
-                int col = m_base + lane_col_a;
-                uint32_t sptr = __cvta_generic_to_shared(
-                    &wrkA[wrkA_base + row * WRK_A_LD + col]);
-                ldmatrix_trans_x4(a_regs[i], sptr);
-            }
-
-            // Load B: 2 ldmatrix.trans.x4 covering 32 N (= 4 N tiles of 8).
-            //         Each x4 gives 16x16 -> we extract 2 N tiles (16x8 each).
-            uint32_t b_x4[2][4];
-            #pragma unroll
-            for (int g = 0; g < 2; g++) {
-                int n_base = wn * N_WARP + g * 16;
-                int row = kk + lane_row_b;
-                int col = n_base + lane_col_b;
-                uint32_t sptr = __cvta_generic_to_shared(
-                    &wrkB[wrkB_base + row * WRK_B_LD + col]);
-                ldmatrix_trans_x4(b_x4[g], sptr);
-            }
-            // Re-pack into per-N-tile registers (each tile uses 2 .b32).
-            // ldmatrix.x4 result for matrix_b 16x16 stored as col-major view:
-            //   sub-tile 0 (regs[0]): K=0..7, N=0..7  -> N-tile 0 lower half
-            //   sub-tile 1 (regs[1]): K=0..7, N=8..15 -> N-tile 1 lower half
-            //   sub-tile 2 (regs[2]): K=8..15, N=0..7 -> N-tile 0 upper half
-            //   sub-tile 3 (regs[3]): K=8..15, N=8..15-> N-tile 1 upper half
-            // So N-tile 0 = {regs[0], regs[2]}, N-tile 1 = {regs[1], regs[3]}.
-            b_regs[0][0] = b_x4[0][0]; b_regs[0][1] = b_x4[0][2];
-            b_regs[1][0] = b_x4[0][1]; b_regs[1][1] = b_x4[0][3];
-            b_regs[2][0] = b_x4[1][0]; b_regs[2][1] = b_x4[1][2];
-            b_regs[3][0] = b_x4[1][1]; b_regs[3][1] = b_x4[1][3];
-
-            // 16 mma calls.
-            #pragma unroll
-            for (int i = 0; i < WTM; i++) {
-                #pragma unroll
-                for (int j = 0; j < WTN; j++) {
-                    mma_m16n8k16(acc[i][j], a_regs[i], b_regs[j], acc[i][j]);
-                }
-            }
+        for (int kk = 0; kk < K_TILE; kk += WG_K) {
+            // MN-major fp16 descriptor: LBO = K-row stride, SBO = 8-elem M chunk stride
+            uint64_t descA = make_desc(
+                &wrkA[wrkA_base + kk * WRK_A_LD + wg_m_off],
+                WRK_A_LD * sizeof(half),                  // LBO = 256
+                16);                                       // SBO = 16
+            uint64_t descB = make_desc(
+                &wrkB[wrkB_base + kk * WRK_B_LD + 0],
+                WRK_B_LD * sizeof(half),
+                16);
+            wgmma_m64n128k16(acc, descA, descB);
         }
+        wgmma_commit();
+        wgmma_wait0();
     }
 
     // ---- Store C ----
-    // mma.m16n8k16 result layout (per thread T):
-    //   d0 = D[T/4,     (T%4)*2 + 0]
-    //   d1 = D[T/4,     (T%4)*2 + 1]
-    //   d2 = D[T/4 + 8, (T%4)*2 + 0]
-    //   d3 = D[T/4 + 8, (T%4)*2 + 1]
-    // For col-major C with ld=M, C[m_row, n_col] = C[n_col * M + m_row].
-    const int t_row = lane / 4;
-    const int t_col = (lane & 3) * 2;
+    // Per-thread accumulator layout for wgmma.m64nN.f32 (per PTX/CUTLASS):
+    //   For each mma block c in 0..N/8-1 (along N), the four regs are
+    //     reg[c*4 + 0] = element at (warp*16 + lane/4,     c*8 + (lane%4)*2 + 0)
+    //     reg[c*4 + 1] = element at (warp*16 + lane/4,     c*8 + (lane%4)*2 + 1)
+    //     reg[c*4 + 2] = element at (warp*16 + lane/4 + 8, c*8 + (lane%4)*2 + 0)
+    //     reg[c*4 + 3] = element at (warp*16 + lane/4 + 8, c*8 + (lane%4)*2 + 1)
+    const int row_base = wg_id * WG_M + warp_in_wg * 16;
+    const int row_lo   = row_base + lane / 4;
+    const int row_hi   = row_lo + 8;
+    const int col_base = (lane & 3) * 2;
     #pragma unroll
-    for (int i = 0; i < WTM; i++) {
-        int m_base = bm + wm * M_WARP + i * MMA_M;
-        #pragma unroll
-        for (int j = 0; j < WTN; j++) {
-            int n_base = bn + wn * N_WARP + j * MMA_N;
-            int r0 = m_base + t_row + 0;
-            int r1 = m_base + t_row + 8;
-            int c0 = n_base + t_col + 0;
-            int c1 = n_base + t_col + 1;
-            C[(size_t)c0 * M + r0] = acc[i][j][0];
-            C[(size_t)c1 * M + r0] = acc[i][j][1];
-            C[(size_t)c0 * M + r1] = acc[i][j][2];
-            C[(size_t)c1 * M + r1] = acc[i][j][3];
-        }
+    for (int c = 0; c < WG_N / 8; c++) {
+        int g_col0 = bn + c * 8 + col_base + 0;
+        int g_col1 = bn + c * 8 + col_base + 1;
+        int g_row_lo = bm + row_lo;
+        int g_row_hi = bm + row_hi;
+        C[(size_t)g_col0 * M + g_row_lo] = acc[c * 4 + 0];
+        C[(size_t)g_col1 * M + g_row_lo] = acc[c * 4 + 1];
+        C[(size_t)g_col0 * M + g_row_hi] = acc[c * 4 + 2];
+        C[(size_t)g_col1 * M + g_row_hi] = acc[c * 4 + 3];
     }
 }
 
@@ -350,12 +325,12 @@ int main(int argc, const char **argv) {
         + (STAGES * N_TILE * K_TILE) * sizeof(float)
         + (STAGES * K_TILE * WRK_A_LD) * sizeof(half)
         + (STAGES * K_TILE * WRK_B_LD) * sizeof(half);
-    cudaFuncSetAttribute(sgemm_v17,
+    cudaFuncSetAttribute(sgemm_v19,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem_bytes);
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        sgemm_v17<<<grid, block, smem_bytes>>>(m, n, k, A, B, C2);
+        sgemm_v19<<<grid, block, smem_bytes>>>(m, n, k, A, B, C2);
         cudaDeviceSynchronize();
     }
     toc = chrono::steady_clock::now();

@@ -25,4 +25,21 @@
 12_vector_4x2: 12_vector_4x2.cu
 	nvcc 12_vector_4x2.cu -Xcompiler "-O3 -fopenmp" -lcublas
 13_tensorcore: 13_tensorcore.cu
-	nvcc 13_tensorcore.cu -Xcompiler "-O3 -fopenmp" -lcublas
+	nvcc 13_tensorcore.cu -arch=sm_90 -O3 -Xcompiler "-O3 -fopenmp" -lcublas -o 13_tensorcore
+
+# --- HPSC 2026 final project optimization series (H100 / sm_90) ---
+NVCC_FLAGS_H100 = -arch=sm_90 -O3 -lineinfo -Xcompiler "-O3 -fopenmp" -lcublas
+
+14_%: 14_%.cu
+	nvcc $< $(NVCC_FLAGS_H100) -o $@
+15_%: 15_%.cu
+	nvcc $< $(NVCC_FLAGS_H100) -o $@
+16_%: 16_%.cu
+	nvcc $< $(NVCC_FLAGS_H100) -o $@
+17_%: 17_%.cu
+	nvcc $< $(NVCC_FLAGS_H100) -o $@
+18_%: 18_%.cu
+	nvcc $< $(NVCC_FLAGS_H100) -o $@
+NVCC_FLAGS_SM90A = -arch=sm_90a -O3 -lineinfo -Xcompiler "-O3 -fopenmp" -lcublas
+19_%: 19_%.cu
+	nvcc $< $(NVCC_FLAGS_SM90A) -o $@

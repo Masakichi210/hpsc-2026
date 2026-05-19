@@ -1,15 +1,18 @@
-// 13_tensorcore.cu  --  HPSC 2026 final submission (kawamura).
-//   H100 SGEMM (FP32 I/O, FP16 mma) at ~168 TFlops (~46% of cuBLAS).
-//   128x128 tile, cp.async double buffer, ldmatrix + mma.sync.m16n8k16.
+// 18_swizzle.cu  --  HPSC 2026 SGEMM optimization, step 5:
+//   Builds on 17_mma by adding an XOR-based swizzle to wrkA / wrkB shmem so
+//   that ldmatrix.trans.x4 hits distinct banks within each 8-lane sub-tile.
 //
-// Per-warp per-K-step (K=16) work:
-//   - 4 x ldmatrix.trans.x4 to load four 16x16 A fragments from wrkA[k][m]
-//   - 2 x ldmatrix.trans.x4 to load 16x32 of B (= four 16x8 B fragments)
-//       from wrkB[k][n]
-//   - 16 x mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+//   Physical offset for logical (k_row, m_col) in wrkA:
+//       k_row * LD + (m_col XOR ((k_row & 7) << 3))     (units: halfs)
+//   Same shape for wrkB with n_col.
 //
-// Each warp accumulates a 64 (M) x 32 (N) tile = 4 WTM x 4 WTN mma blocks.
-// Eight warps per block cover 128 x 128.
+//   LD = M_TILE (= 128 halfs); padding dropped because the swizzle plays
+//   the role of bank-conflict avoidance.
+//
+//   The 4-bit XOR mask `(k_row & 7) << 3` permutes 8-half chunks within a
+//   row. For 8-aligned base columns (m_base, n_base) the swizzle preserves
+//   the 4- and 8-half contiguity needed for half2 stores (in convert_stage)
+//   and 8-half ldmatrix reads.
 
 #include <iostream>
 #include <typeinfo>
@@ -31,8 +34,8 @@ using namespace nvcuda;
 #define WARPS    (WARPS_M * WARPS_N)
 #define THREADS  (WARPS * 32)
 
-#define M_WARP   (M_TILE / WARPS_M)         // 64
-#define N_WARP   (N_TILE / WARPS_N)         // 32
+#define M_WARP   (M_TILE / WARPS_M)
+#define N_WARP   (N_TILE / WARPS_N)
 
 #define MMA_M    16
 #define MMA_N    8
@@ -40,13 +43,16 @@ using namespace nvcuda;
 #define WTM      (M_WARP / MMA_M)           // 4
 #define WTN      (N_WARP / MMA_N)           // 4
 
-// wrkA[k][m], wrkB[k][n]; +8 half pad to break bank patterns
-// (proper XOR swizzle comes in 18).
-#define WRK_A_LD (M_TILE + 8)
-#define WRK_B_LD (N_TILE + 8)
+// NO padding; bank conflicts handled by swizzle.
+#define WRK_A_LD M_TILE
+#define WRK_B_LD N_TILE
 
 #define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 4))   // 4
 #define B_STEPS  ((N_TILE * K_TILE) / (THREADS * 4))   // 4
+
+__device__ __forceinline__ int swz(int col, int row) {
+    return col ^ ((row & 7) << 3);
+}
 
 // ---- cp.async helpers ----
 __device__ __forceinline__
@@ -64,9 +70,6 @@ __device__ __forceinline__ void cp_async_wait_all() {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
 
-// ---- ldmatrix helpers ----
-// Loads a 16x16 (4 x 8x8 sub-tiles) of fp16 from shared memory with transpose.
-// Returns 4 .b32 regs per thread (= 8 halfs = 4 half2).
 __device__ __forceinline__
 void ldmatrix_trans_x4(uint32_t (&r)[4], uint32_t smem_int_ptr) {
     asm volatile(
@@ -76,11 +79,6 @@ void ldmatrix_trans_x4(uint32_t (&r)[4], uint32_t smem_int_ptr) {
         : "r"(smem_int_ptr));
 }
 
-// ---- mma helpers ----
-// D = A * B + C   (m16 n8 k16, fp32 acc, fp16 inputs)
-//   A: 4 x .b32  (= 8 fp16)
-//   B: 2 x .b32  (= 4 fp16)
-//   C/D: 4 x .f32
 __device__ __forceinline__
 void mma_m16n8k16(float (&d)[4],
                   const uint32_t (&a)[4],
@@ -98,7 +96,7 @@ void mma_m16n8k16(float (&d)[4],
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 
-__global__ void sgemm_v17(int M, int N, int K,
+__global__ void sgemm_v18(int M, int N, int K,
                           const float* __restrict__ A,
                           const float* __restrict__ B,
                           float* __restrict__ C) {
@@ -107,8 +105,8 @@ __global__ void sgemm_v17(int M, int N, int K,
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
-    const int wm = warp_id / WARPS_N;        // 0..1
-    const int wn = warp_id % WARPS_N;        // 0..3
+    const int wm = warp_id / WARPS_N;
+    const int wn = warp_id % WARPS_N;
 
     extern __shared__ unsigned char smem[];
     float* stgA = reinterpret_cast<float*>(smem);
@@ -156,7 +154,11 @@ __global__ void sgemm_v17(int M, int N, int K,
                 &stgA[stgA_base + k_off * M_TILE + m_off]);
             half2 h01 = __floats2half2_rn(v.x, v.y);
             half2 h23 = __floats2half2_rn(v.z, v.w);
-            half* dst = &wrkA[wrkA_base + k_off * WRK_A_LD + m_off];
+            // Swizzle: m_phys = m_off XOR ((k_off & 7) * 8).
+            // m_off is a multiple of 4; XOR by multiples of 8 preserves the
+            // 4-element run because (m_off & 3) == (m_phys & 3).
+            int m_phys = swz(m_off, k_off);
+            half* dst = &wrkA[wrkA_base + k_off * WRK_A_LD + m_phys];
             *reinterpret_cast<half2*>(dst + 0) = h01;
             *reinterpret_cast<half2*>(dst + 2) = h23;
         }
@@ -170,14 +172,15 @@ __global__ void sgemm_v17(int M, int N, int K,
             int k_off  = k_off4 * 4;
             float4 v = *reinterpret_cast<float4*>(
                 &stgB[stgB_base + n_off * K_TILE + k_off]);
-            wrkB[wrkB_base + (k_off + 0) * WRK_B_LD + n_off] = __float2half(v.x);
-            wrkB[wrkB_base + (k_off + 1) * WRK_B_LD + n_off] = __float2half(v.y);
-            wrkB[wrkB_base + (k_off + 2) * WRK_B_LD + n_off] = __float2half(v.z);
-            wrkB[wrkB_base + (k_off + 3) * WRK_B_LD + n_off] = __float2half(v.w);
+            // Each of the 4 halfs is written to a different k row; the
+            // swizzle therefore must be recomputed per i.
+            wrkB[wrkB_base + (k_off + 0) * WRK_B_LD + swz(n_off, k_off + 0)] = __float2half(v.x);
+            wrkB[wrkB_base + (k_off + 1) * WRK_B_LD + swz(n_off, k_off + 1)] = __float2half(v.y);
+            wrkB[wrkB_base + (k_off + 2) * WRK_B_LD + swz(n_off, k_off + 2)] = __float2half(v.z);
+            wrkB[wrkB_base + (k_off + 3) * WRK_B_LD + swz(n_off, k_off + 3)] = __float2half(v.w);
         }
     };
 
-    // Accumulators: WTM x WTN tiles of 16x8, each held as 4 floats per thread.
     float acc[WTM][WTN][4];
     #pragma unroll
     for (int i = 0; i < WTM; i++)
@@ -187,7 +190,6 @@ __global__ void sgemm_v17(int M, int N, int K,
             for (int x = 0; x < 4; x++)
                 acc[i][j][x] = 0.0f;
 
-    // ---- Prologue: load + convert tile 0 ----
     issue_load(0, 0);
     cp_async_commit();
 
@@ -207,68 +209,47 @@ __global__ void sgemm_v17(int M, int N, int K,
         convert_stage(cur);
         __syncthreads();
 
-        // ---- MMA over K_TILE in steps of MMA_K=16 ----
         const int wrkA_base = cur * (K_TILE * WRK_A_LD);
         const int wrkB_base = cur * (K_TILE * WRK_B_LD);
 
-        // Compute lane-local row address used by ldmatrix.
-        // ldmatrix.x4 takes 32 thread addresses (one row each, 8 halfs).
-        // For matrix_a 16x16 col-major-in-shmem, with .trans we feed:
-        //   lane T (0..7)  -> row offset (kk + T)   in K, col offset 0       in M
-        //   lane T (8..15) -> row offset (kk + T-8) in K, col offset 8       in M
-        //   lane T (16..23)-> row offset (kk + T-16 + 8) in K, col offset 0  in M
-        //   lane T (24..31)-> row offset (kk + T-24 + 8) in K, col offset 8  in M
-        // For matrix_b (16x16 = 2 N-tiles of 16x8 stacked horizontally in N),
-        // similar pattern but col offset spans 16 N halfs.
-        //
-        // A is loaded once per M-tile (WTM = 4 calls per K-step).
-        // B is loaded once per pair of N-tiles (WTN/2 = 2 calls per K-step).
-        const int lane_row_a = (lane & 7) + ((lane >> 4) << 3);      // 0..7 or 8..15
-        const int lane_col_a = ((lane >> 3) & 1) << 3;               // 0 or 8
-        const int lane_row_b = (lane & 7) + ((lane >> 4) << 3);
-        const int lane_col_b = ((lane >> 3) & 1) << 3;
+        // Lane decomposition for ldmatrix.x4 (matches v17).
+        const int t_row     = lane & 7;
+        const int sub_k_off = (lane >> 4) << 3;     // 0 or 8
+        const int sub_c_off = ((lane >> 3) & 1) << 3; // 0 or 8
 
         uint32_t a_regs[WTM][4];
         uint32_t b_regs[WTN][2];
 
         #pragma unroll
         for (int kk = 0; kk < K_TILE; kk += MMA_K) {
-            // Load A: 4 ldmatrix.trans.x4, one per M tile.
+            int k_row    = kk + sub_k_off + t_row;
+            int shift    = (k_row & 7) << 3;        // = t_row * 8
+
             #pragma unroll
             for (int i = 0; i < WTM; i++) {
                 int m_base = wm * M_WARP + i * MMA_M;
-                int row = kk + lane_row_a;
-                int col = m_base + lane_col_a;
+                int m_col  = m_base + sub_c_off;
+                int m_phys = m_col ^ shift;
                 uint32_t sptr = __cvta_generic_to_shared(
-                    &wrkA[wrkA_base + row * WRK_A_LD + col]);
+                    &wrkA[wrkA_base + k_row * WRK_A_LD + m_phys]);
                 ldmatrix_trans_x4(a_regs[i], sptr);
             }
 
-            // Load B: 2 ldmatrix.trans.x4 covering 32 N (= 4 N tiles of 8).
-            //         Each x4 gives 16x16 -> we extract 2 N tiles (16x8 each).
             uint32_t b_x4[2][4];
             #pragma unroll
             for (int g = 0; g < 2; g++) {
                 int n_base = wn * N_WARP + g * 16;
-                int row = kk + lane_row_b;
-                int col = n_base + lane_col_b;
+                int n_col  = n_base + sub_c_off;
+                int n_phys = n_col ^ shift;
                 uint32_t sptr = __cvta_generic_to_shared(
-                    &wrkB[wrkB_base + row * WRK_B_LD + col]);
+                    &wrkB[wrkB_base + k_row * WRK_B_LD + n_phys]);
                 ldmatrix_trans_x4(b_x4[g], sptr);
             }
-            // Re-pack into per-N-tile registers (each tile uses 2 .b32).
-            // ldmatrix.x4 result for matrix_b 16x16 stored as col-major view:
-            //   sub-tile 0 (regs[0]): K=0..7, N=0..7  -> N-tile 0 lower half
-            //   sub-tile 1 (regs[1]): K=0..7, N=8..15 -> N-tile 1 lower half
-            //   sub-tile 2 (regs[2]): K=8..15, N=0..7 -> N-tile 0 upper half
-            //   sub-tile 3 (regs[3]): K=8..15, N=8..15-> N-tile 1 upper half
-            // So N-tile 0 = {regs[0], regs[2]}, N-tile 1 = {regs[1], regs[3]}.
             b_regs[0][0] = b_x4[0][0]; b_regs[0][1] = b_x4[0][2];
             b_regs[1][0] = b_x4[0][1]; b_regs[1][1] = b_x4[0][3];
             b_regs[2][0] = b_x4[1][0]; b_regs[2][1] = b_x4[1][2];
             b_regs[3][0] = b_x4[1][1]; b_regs[3][1] = b_x4[1][3];
 
-            // 16 mma calls.
             #pragma unroll
             for (int i = 0; i < WTM; i++) {
                 #pragma unroll
@@ -280,24 +261,18 @@ __global__ void sgemm_v17(int M, int N, int K,
     }
 
     // ---- Store C ----
-    // mma.m16n8k16 result layout (per thread T):
-    //   d0 = D[T/4,     (T%4)*2 + 0]
-    //   d1 = D[T/4,     (T%4)*2 + 1]
-    //   d2 = D[T/4 + 8, (T%4)*2 + 0]
-    //   d3 = D[T/4 + 8, (T%4)*2 + 1]
-    // For col-major C with ld=M, C[m_row, n_col] = C[n_col * M + m_row].
-    const int t_row = lane / 4;
-    const int t_col = (lane & 3) * 2;
+    const int t_row_c = lane / 4;
+    const int t_col_c = (lane & 3) * 2;
     #pragma unroll
     for (int i = 0; i < WTM; i++) {
         int m_base = bm + wm * M_WARP + i * MMA_M;
         #pragma unroll
         for (int j = 0; j < WTN; j++) {
             int n_base = bn + wn * N_WARP + j * MMA_N;
-            int r0 = m_base + t_row + 0;
-            int r1 = m_base + t_row + 8;
-            int c0 = n_base + t_col + 0;
-            int c1 = n_base + t_col + 1;
+            int r0 = m_base + t_row_c + 0;
+            int r1 = m_base + t_row_c + 8;
+            int c0 = n_base + t_col_c + 0;
+            int c1 = n_base + t_col_c + 1;
             C[(size_t)c0 * M + r0] = acc[i][j][0];
             C[(size_t)c1 * M + r0] = acc[i][j][1];
             C[(size_t)c0 * M + r1] = acc[i][j][2];
@@ -350,12 +325,12 @@ int main(int argc, const char **argv) {
         + (STAGES * N_TILE * K_TILE) * sizeof(float)
         + (STAGES * K_TILE * WRK_A_LD) * sizeof(half)
         + (STAGES * K_TILE * WRK_B_LD) * sizeof(half);
-    cudaFuncSetAttribute(sgemm_v17,
+    cudaFuncSetAttribute(sgemm_v18,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem_bytes);
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        sgemm_v17<<<grid, block, smem_bytes>>>(m, n, k, A, B, C2);
+        sgemm_v18<<<grid, block, smem_bytes>>>(m, n, k, A, B, C2);
         cudaDeviceSynchronize();
     }
     toc = chrono::steady_clock::now();
